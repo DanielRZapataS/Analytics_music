@@ -1,0 +1,382 @@
+---
+title: "Spotify"
+author: "Daniel Zapata"
+date: "6 de marzo de 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# loading required packages
+```{r}
+library(data.table)
+# library(tm)
+library(stringi)
+library(spotifyr)
+library(plyr)
+library(tidyverse)
+library(httr)
+library(rvest)
+library(stringr)
+library(ggthemes)
+library(tidytext)
+library(wordcloud)
+library(ggridges)
+library(wesanderson)
+library(yarrr)
+library(knitr)
+library(kableExtra)
+library(radarchart)
+
+```
+
+# set up Spotify client ID and client secret
+```{r}
+creds <- readLines("spotify_credentials.txt")
+Sys.setenv(SPOTIFY_CLIENT_ID = creds[1])
+Sys.setenv(SPOTIFY_CLIENT_SECRET = creds[2])
+```
+
+#using spoitfyr
+```{r}
+fellas <- get_artist_audio_features("losPetitFellas") %>% data.table()
+fellas
+```
+
+```{r}
+unique(fellas$album_name)
+fellas[, .N, by = album_name]
+```
+
+En Genius no se encuentra el album 1320 Sijazz que es un album en vivo. Tampoco estan todas las canciones de souvenir ya que algunas se repiten de albunes anteriores. 
+
+# Getting artist ID on Genius
+```{r}
+creds <- readLines("genius_credentials.txt")
+token <- creds[3]
+
+genius_get_artists <- function(artist_name, n_results = 10) {
+  baseURL <- 'https://api.genius.com/search?q=' 
+  requestURL <- paste0(baseURL, gsub(' ', '%20', artist_name),
+                       '&per_page=', n_results,
+                       '&access_token=', token)
+  
+  res <- GET(requestURL) %>% content %>% .$response %>% .$hits
+  
+  map_df(1:length(res), function(x) {
+    tmp <- res[[x]]$result$primary_artist
+    list(
+      artist_id = tmp$id,
+      artist_name = tmp$name
+    )
+  }) %>% unique
+}
+
+
+genius_artists <- genius_get_artists('LosPetitFellas')
+genius_artists
+```
+
+# Getting track urls
+```{r}
+baseURL <- 'https://api.genius.com/artists/' 
+requestURL <- paste0(baseURL, genius_artists$artist_id[1], '/songs')
+
+track_lyric_urls <- list()
+i <- 1
+while (i > 0) {
+  tmp <- GET(requestURL, query = list(access_token = token, per_page = 50, page = i)) %>% content %>% .$response
+  track_lyric_urls <- c(track_lyric_urls, tmp$songs)
+  if (!is.null(tmp$next_page)) {
+    i <- tmp$next_page
+  } else {
+    break
+  }
+}
+
+
+
+# Filtering to get urls only for tracks on which fellas Swift is the primary artist
+filtered_track_lyric_urls <- c()
+filtered_track_lyric_titles <- c()
+index <- c()
+
+for (i in 1:length(track_lyric_urls)) {
+  if (track_lyric_urls[[i]]$primary_artist$name == "LosPetitFellas") {
+    filtered_track_lyric_urls <- append(filtered_track_lyric_urls, track_lyric_urls[[i]]$url)
+    filtered_track_lyric_titles <- append(filtered_track_lyric_titles, track_lyric_urls[[i]]$title)
+    
+    index <- append(index, i)
+  }
+}
+
+
+```
+
+hay que juntar ambas funtes, para que sea más facil eliminaré signos de puntuación y tildes de los titulos
+```{r}
+filtered_track_lyric_titles <- tolower(filtered_track_lyric_titles)
+filtered_track_lyric_titles <- 
+  stri_trans_general(filtered_track_lyric_titles,"Latin-ASCII")
+filtered_track_lyric_titles <- tm::removePunctuation(filtered_track_lyric_titles)
+filtered_track_lyric_titles
+```
+
+```{r}
+fellas$track_name <-  tolower(fellas$track_name)
+fellas$track_name <- stri_trans_general(fellas$track_name,"Latin-ASCII")
+fellas$track_name <- tm::removePunctuation(fellas$track_name)
+fellas$track_name
+```
+
+```{r}
+fellas_lyrics <- data.frame(filtered_track_lyric_urls, filtered_track_lyric_titles)
+fellas_lyrics <- fellas_lyrics[filtered_track_lyric_titles %in% fellas$track_name, ]
+```
+
+```{r}
+filtered_track_lyric_titles[!(filtered_track_lyric_titles %in% fellas$track_name)]
+```
+
+```{r}
+fellas$track_name[!(fellas$track_name %in% filtered_track_lyric_titles)]
+```
+```{r}
+fellas_lyrics$filtered_track_lyric_urls <- as.character(fellas_lyrics$filtered_track_lyric_urls)
+fellas_lyrics$filtered_track_lyric_titles <- as.character(fellas_lyrics$filtered_track_lyric_titles)
+```
+
+# Webscraping lyrics using rvest 
+```{r}
+lyric_text <- c()
+for (i in 1:nrow(fellas_lyrics)) {
+  lyric_text_pivot <- read_html(fellas_lyrics$filtered_track_lyric_urls[i]) %>% 
+    html_nodes(".lyrics p") %>% 
+    html_text()
+  lyric_text[i] <- lyric_text_pivot[lyric_text_pivot != ""]
+}
+
+```
+
+# Cleaning and standardizing lyrics
+```{r}
+for (i in 1:nrow(fellas_lyrics)) {
+  lyric_text[i] <- gsub("([a-z])([A-Z])", "\\1 \\2", lyric_text[i])
+  lyric_text[i] <- gsub("\n", " ", lyric_text[i])
+  lyric_text[i] <- gsub("\\[.*?\\]", " ", lyric_text[i])
+  lyric_text[i] <- tolower(lyric_text[i])
+  lyric_text[i] <- gsub("[ [:punct:] ]", " ", lyric_text[i])
+  lyric_text[i] <- gsub(" {2,}", " ", lyric_text[i])
+  lyric_text[i] <-  stri_trans_general(lyric_text[i],"Latin-ASCII")
+   lyric_text[i] <- tm::removePunctuation(lyric_text[i])
+}
+lyric_text[1]
+```
+
+```{r}
+genius_data <- data.frame(track_name = fellas_lyrics$filtered_track_lyric_titles, lyrics = lyric_text)
+genius_data$track_name <- as.character(genius_data$track_name)
+genius_data$lyrics <- as.character(genius_data$lyrics)
+genius_data
+```
+
+# joining Spotify and Genius data
+```{r}
+spotify_genius <- full_join(genius_data, fellas, by = "track_name")
+spotify_genius
+```
+
+```{r}
+spotify_genius <- data.table(spotify_genius)
+setkey(spotify_genius, "album_release_year")
+spotify_genius[, album_name := factor(album_name, ordered = T)]
+spotify_genius[, valence := as.numeric(valence)]
+options("digits" = 3)
+
+```
+
+```{r}
+
+# valence ridge plot (I used fig.height = 6, fig.width = 6 in an rmd)
+spotify_genius %>% ggplot(aes(x = valence, fill = album_name)) + 
+  geom_density(position = "identity", alpha = 0.6) +
+   scale_x_continuous(name = "Valencia",
+                           breaks = seq(0, 1, 0.05),
+                           limits=c(0, 1)) +
+        scale_y_continuous(name = "Density") +
+        ggtitle("Distribución de la valencia por album") +
+        theme_bw() +
+        theme(plot.title = element_text(size = 14, family = "Tahoma", face = "bold"),
+              text = element_text(size = 12, family = "Tahoma")) +
+        scale_fill_brewer(palette="Accent")
+
+```
+# table: album by mean valence
+```{r}
+spotify_genius %>% 
+  group_by(album_name) %>% 
+  summarise(mean(valence)) %>% 
+  arrange(desc(`mean(valence)`)) %>% 
+  kable() %>% 
+  kable_styling("striped", full_width = F, position = "left") %>% 
+  row_spec(row = 1:4, background = "#fffce4", color = "red")
+```
+
+# table: top 5 songs by valence
+```{r}
+spotify_genius %>% 
+  select(track_name, album_name, valence) %>% 
+  top_n(5) %>% 
+  arrange(-valence) %>% 
+  kable() %>% 
+  kable_styling("striped", full_width = F, position = "left") %>% 
+  row_spec(row = 1:5, background = "azure", color = "deeppink")
+
+```
+# table: top 5 songs by lower valence
+```{r}
+spotify_genius %>% 
+  select(track_name, album_name, valence) %>% 
+  top_n(-5) %>% 
+  arrange(-valence) %>% 
+  kable() %>% 
+  kable_styling("striped", full_width = F, position = "left") %>% 
+  row_spec(row = 1:5, background = "azure", color = "deeppink")
+
+```
+# sonic score graph
+```{r}
+pirateplot(valence + danceability + energy ~ album_release_date, spotify_genius,
+           pal = c(wes_palettes$GrandBudapest2, wes_palettes$Moonrise3[1:2]), 
+           xlab = "álbum", ylab = "sonic score",
+           theme = 0, point.o = 0.7, avg.line.o = 1, jitter.val = .05, 
+           bty = "n", cex.axis = 0.6, xaxt = "n") 
+axis(1, cex.axis = 0.6, lwd = 0)
+legend("topright", c("1:Historias Mínimas", "2: Souvenir", "3: Formas Para Perderse o I.D.E.A.S", "4: 1320 Sijazz"), bty = "n", cex = 0.6) 
+```
+```{r}
+spotify_genius %>% 
+  mutate(sonic_score = valence + danceability + energy) %>% 
+  select(album_name, track_name, sonic_score) %>% 
+  arrange(desc(sonic_score)) %>% 
+  kable() %>% 
+  kable_styling(full_width = F, position = "left") %>% 
+  row_spec(row = 1:46, background = "seashell", color = "#b39db2")
+```
+
+# album by danceability
+```{r}
+spotify_genius %>% 
+  group_by(album_name) %>% 
+  summarise(mean(danceability)) %>% 
+  arrange(desc(`mean(danceability)`)) %>% 
+  kable() %>% 
+  kable_styling(full_width = F, position = "left") %>% 
+  row_spec(row = 1:4, background = "seashell", color = "#b39db2")
+```
+
+# Lyrics 
+```{r}
+tidy_fellas <- spotify_genius %>% unnest_tokens(word, lyrics)
+
+custom_stop_words <- bind_rows(stop_words,
+                               data_frame(
+                               word = stri_trans_general(tm::stopwords("spanish") , "Latin-ASCII"),
+                               lexicon = "custom"
+                               ))
+
+tidier_fellas  <- tidy_fellas  %>%
+    anti_join(custom_stop_words) 
+
+word_count <- tidier_fellas %>%
+  count(word, sort = TRUE) %>% 
+  mutate(word = reorder(word, n)) %>%
+  ungroup()
+
+
+```
+
+```{r}
+wordcloud(words = word_count$word, freq = word_count$n,
+          max.words=100, random.order=FALSE, 
+          colors= c(wes_palettes$Moonrise3[c(1:2,5)], wes_palettes$Royal2[5]))
+```
+
+```{r}
+# how many tracks does the word "remember" appear in?
+tidier_fellas %>% 
+  select(track_name, word) %>% 
+  filter(word == "solo") %>% 
+  unique() %>% 
+  select(track_name)
+```
+```{r}
+# wordcloud: fellas Swift the album
+word_count_ts <- tidier_fellas %>%
+  filter(album_name == "Historias Mínimas") %>% 
+  count(word, sort = TRUE) %>% 
+  mutate(word = reorder(word, n)) %>%
+  ungroup()
+
+wordcloud(words = word_count_ts$word, freq = word_count_ts$n,
+          max.words=25, random.order=FALSE, 
+          colors= c(wes_palettes$GrandBudapest2[3:1]))
+```
+
+```{r}
+# wordcloud: reputation
+word_count_rep <- tidier_fellas %>%
+  filter(album_name == "Formas Para Perderse o I.D.E.A.S") %>% 
+  count(word, sort = TRUE) %>% 
+  mutate(word = reorder(word, n)) %>%
+  ungroup()
+
+wordcloud(words = word_count_rep$word, freq = word_count_rep$n,
+          max.words=25, random.order=FALSE, 
+          colors= c(wes_palettes$GrandBudapest2[3:1]))
+```
+
+# more cleaning, can be done earlier
+```{r}
+tidier_fellas$album_release_year <- as.character(tidier_fellas$album_release_year)
+tidier_fellas$album_release_year <- as.numeric(substr(tidier_fellas$album_release_year, 1, 4))
+
+tidy_fellas$album_release_year <- as.character(tidy_fellas$album_release_year)
+tidy_fellas$album_release_year <- as.numeric(substr(tidy_fellas$album_release_year, 1, 4))
+```
+
+# creating a "lexical diversity" dataset
+```{r}
+unique(tidy_fellas$album_release_date)
+```
+
+
+```{r}
+tidy_fellas <- data.table(tidy_fellas)
+lexical_diversity <-
+tidy_fellas[is.na(word) == F, .(lex_div = uniqueN(word) / length(word)), by = .(track_name, album_name)]
+levels(lexical_diversity$album_name)
+```
+
+# lexical diversity plot
+```{r}
+pirateplot(lex_div ~ album_name, lexical_diversity,
+           pal = c("cyan3", "darkgoldenrod1", "maroon4", "red3", "#b39db2", "black"),
+           xlab = "album", ylab = "lexical diversity",
+           theme = 0, point.o = 0.5, avg.line.o = 1, jitter.val = .05, 
+           bty = "n", cex.axis = 0.6, xaxt = "n") 
+axis(1, cex.axis = 0.6, lwd = 0)
+legend("topright", c("1: Formas Para Perderse o I.D.E.A.S","2:Historias Mínimas", "3: Souvenir"), bty = "n", cex = 0.6) 
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
